@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,7 +28,6 @@ jobs:
           set -e
           SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
           echo "ANDROID SDK: $SDK"
-          ls "$SDK" || true
           if [ -d "$SDK/platforms/android-35" ]; then
             echo "platform 35 already installed"
             exit 0
@@ -34,7 +36,6 @@ jobs:
           if [ -z "$SDKM" ] && [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
             SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
           fi
-          echo "sdkmanager: $SDKM"
           yes | "$SDKM" --licenses > /dev/null 2>&1 || true
           "$SDKM" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
@@ -44,7 +45,29 @@ jobs:
           gradle-version: '8.9'
 
       - name: Build debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Publish build log (failure only)
+        if: failure()
+        shell: bash
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f build.log ]; then
+            echo "no build.log produced" > build.log
+          fi
+          rm -rf /tmp/cilog && mkdir -p /tmp/cilog
+          cp build.log /tmp/cilog/build.log
+          cd /tmp/cilog
+          git init -q
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add build.log
+          git -c user.name=github-actions -c user.email=actions@github.com commit -qm "ci build log"
+          git push -f origin HEAD:ci-log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
