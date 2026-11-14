@@ -75,3 +75,21 @@ jobs:
           name: MashAllahBilling-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+
+      # Makes the APK downloadable without a GitHub login:
+      # https://github.com/<owner>/<repo>/raw/apk/app-debug.apk
+      - name: Publish APK to 'apk' branch
+        if: success()
+        shell: bash
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf /tmp/apkpub && mkdir -p /tmp/apkpub
+          cp app/build/outputs/apk/debug/app-debug.apk /tmp/apkpub/
+          cd /tmp/apkpub
+          git init -q
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add app-debug.apk
+          git -c user.name=github-actions -c user.email=actions@github.com commit -qm "latest debug apk"
+          git push -f origin HEAD:apk
