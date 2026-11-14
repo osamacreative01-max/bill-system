@@ -1,5 +1,19 @@
 # APK banane aur phone pe live chalane ka guide
 
+## Sab se aasan tareeqa — seedha APK download (kuch install nahi)
+
+Har build ke baad APK khud yahan aa jati hai (GitHub login ki bhi zaroorat nahi):
+
+**https://github.com/osamacreative01-max/bill-system/raw/apk/app-debug.apk**
+
+Phone ke browser mein ye link kholein → file download → install.
+Code update karne ke ~4 minute baad ye link naya APK de deta hai.
+Build ka status: https://github.com/osamacreative01-max/bill-system/actions
+
+Neeche diye gaye do raaste sirf tab chahiye jab aap khud code build/change karna chahein.
+
+---
+
 Do raaste hain. Koi ek chunein — dono ka nateeja same APK hota hai
 (`app-debug.apk`), jo phone pe install ho jata hai.
 
