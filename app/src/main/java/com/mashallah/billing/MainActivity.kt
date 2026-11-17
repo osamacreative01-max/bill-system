@@ -51,10 +51,12 @@ class MainActivity : Activity() {
     private lateinit var totalView: TextView
     private lateinit var todayView: TextView
     private lateinit var status: TextView
+    private lateinit var logView: TextView
     private lateinit var printer: IPrintBlePrinter
     private val prefs by lazy { getSharedPreferences("billing", MODE_PRIVATE) }
     private val historyFile by lazy { File(filesDir, "bills.jsonl") }
     private val main = Handler(Looper.getMainLooper())
+    private val logLines = ArrayDeque<String>()
     private var billNo = 1
 
     private val total get() = items.sumOf { it.amount }
@@ -64,8 +66,21 @@ class MainActivity : Activity() {
         loadBill()
         loadHistory()
         setContentView(buildUi())
-        printer = IPrintBlePrinter(this) { msg -> main.post { status.text = msg } }
+        printer = IPrintBlePrinter(this) { msg -> log(msg) }
         refresh()
+    }
+
+    /** Har printer message status line aur debug log dono mein jata hai. */
+    private fun log(msg: String) {
+        main.post {
+            val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+            logLines.addLast("$stamp  $msg")
+            while (logLines.size > 150) logLines.removeFirst()
+            if (::status.isInitialized) {
+                status.text = msg
+                logView.text = logLines.toList().takeLast(5).joinToString("\n")
+            }
+        }
     }
 
     override fun onDestroy() {
@@ -96,6 +111,14 @@ class MainActivity : Activity() {
             setPadding(0, dp(6), 0, dp(10))
         }
         page.addView(status)
+
+        logView = TextView(this).apply {
+            textSize = 10f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.DKGRAY)
+            setPadding(0, 0, 0, dp(8))
+        }
+        page.addView(logView)
 
         val name = EditText(this).apply {
             hint = "Item name (e.g. Zinger Burger)"
@@ -151,6 +174,7 @@ class MainActivity : Activity() {
         page.addView(todayView)
 
         page.addView(button("SC03H Printer Connect") { connectPrinter() }, lp())
+        page.addView(button("Debug log") { showDebugLog() }, lp())
 
         val actionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         actionRow.addView(button("Test Print") { printBill(test = true) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -372,6 +396,7 @@ class MainActivity : Activity() {
 
     private fun printBill(test: Boolean) {
         if (!printer.isReady) {
+            log("Print nahi hua: printer ready nahi hai — pehle SC03H Printer Connect dabayein")
             toast("Pehle SC03H printer connect karein")
             return
         }
@@ -542,6 +567,7 @@ class MainActivity : Activity() {
     private fun connectPrinter() {
         val missing = missingPermissions()
         if (missing.isNotEmpty()) {
+            log("Bluetooth permission maangi ja rahi hai")
             requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
             return
         }
@@ -557,6 +583,31 @@ class MainActivity : Activity() {
             return
         }
         printer.scanAndConnect()
+    }
+
+    /** Poora printer log — WhatsApp par khud ko bhej kar share kiya ja sakta hai. */
+    private fun showDebugLog() {
+        val body = TextView(this).apply {
+            text = if (logLines.isEmpty()) "(abhi koi log nahi)" else logLines.joinToString("\n")
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        val scroll = ScrollView(this).apply { addView(body) }
+        AlertDialog.Builder(this)
+            .setTitle("Debug log")
+            .setView(scroll)
+            .setPositiveButton("Share") { _, _ ->
+                val intent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "MashAllah Billing — printer log")
+                    putExtra(Intent.EXTRA_TEXT, logLines.joinToString("\n"))
+                }
+                startActivity(Intent.createChooser(intent, "Log kahan bhejein?"))
+            }
+            .setNegativeButton("Close", null)
+            .show()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -599,19 +650,33 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
 
     @Volatile private var ready = false
     @Volatile private var printing = false
+    @Volatile private var inFlight = false
+    private var ackWarned = false
+    /** true -> write-with-response (flow control ack se), false -> no-response (timer se). */
+    private var writeNeedsResponse = true
 
     private var mtu = 23
     private var chunkSize = 20
     private var job: ByteArray? = null
+    /** Un byte offsets par printer ko saans lene ka waqt dena hai (packet boundaries). */
+    private var burstEnds: IntArray = IntArray(0)
     private var offset = 0
     private var lastPct = -1
     private var lastBattery = -1
+    private var statusFrames = 0
+    /** Agli chunk se pehle burst pause dena hai? */
+    private var pendingPause = false
     private var onJobComplete: ((Boolean) -> Unit)? = null
     private var discoveryFinished = false
 
     /** GATT allows only one outstanding operation, so CCCD writes are queued. */
     private val pendingDescriptors =
         ArrayDeque<Pair<BluetoothGattCharacteristic, BluetoothGattDescriptor>>()
+
+    private val nextChunk = Runnable { sendNext() }
+
+    /** write-with-response ke ack ka intezaar; 3s tak kuch na aaye to job fail kar dein. */
+    private val ackWatchdog = Runnable { onAckTimeout() }
 
     private val readyFallback = Runnable { gatt?.let { finishDiscovery(it) } }
 
@@ -729,6 +794,9 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
         mtu = 23
         chunkSize = 20
         lastBattery = -1
+        ackWarned = false
+        inFlight = false
+        statusFrames = 0
         discoveryFinished = false
         pendingDescriptors.clear()
         main.removeCallbacks(connectTimeout)
@@ -739,14 +807,19 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
     fun close() {
         main.removeCallbacks(connectTimeout)
         main.removeCallbacks(scanTimeout)
+        main.removeCallbacks(ackWatchdog)
+        main.removeCallbacks(nextChunk)
         main.removeCallbacksAndMessages(null)
         stopScan()
         val wasPrinting = printing
         ready = false
         printing = false
+        inFlight = false
+        writeNeedsResponse = true
         discoveryFinished = false
         pendingDescriptors.clear()
         job = null
+        burstEnds = IntArray(0)
         offset = 0
         try {
             gatt?.disconnect()
@@ -765,12 +838,15 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
 
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+            // Callback kabhi connectGatt() ke return se pehle bhi aa sakta hai.
+            if (gatt == null) gatt = g
             if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                 report("Bluetooth connect hua — services dhoond raha hai…")
                 g.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 ready = false
                 printing = false
+                inFlight = false
                 report("Printer disconnect ho gaya")
                 close()
             } else if (status != BluetoothGatt.GATT_SUCCESS) {
@@ -781,6 +857,7 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            if (gatt == null) gatt = g
             main.removeCallbacks(connectTimeout)
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 report("Services discovery fail (status $status)")
@@ -789,12 +866,17 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
             }
             val service = g.getService(SERVICE_ID)
             // Prefer the documented ae01 write characteristic, else any writable one.
-            writeChar = service?.getCharacteristic(WRITE_ID) ?: allWritable(g).firstOrNull()
-            if (writeChar == null) {
+            val candidate = service?.getCharacteristic(WRITE_ID) ?: allWritable(g).firstOrNull()
+            if (candidate == null) {
                 report("Printer ka write channel nahi mila — firmware check karein")
                 close()
                 return
             }
+            writeChar = candidate
+            writeNeedsResponse =
+                (candidate.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+            val mode = if (writeNeedsResponse) "write" else "write no-response"
+            report("Printer channel: ${shortUuid(candidate.uuid)} ($mode)")
             subscribeNotifications(g)
             main.removeCallbacks(readyFallback)
             main.postDelayed(readyFallback, 3_000)
@@ -813,10 +895,11 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
                 abortJob("Print fail (status $status) — printer ko off/on kar ke dobara connect karein")
                 return
             }
-            val size = job?.size ?: 0
-            val delay = if (size > 20_000) 25L else 10L
-            val drainPause = offset > 0 && offset % 4096 < chunkSize
-            main.postDelayed({ sendNext() }, if (drainPause) 600L else delay)
+            if (!writeNeedsResponse) return // no-response mode timer se chalta hai
+            main.removeCallbacks(ackWatchdog)
+            if (!inFlight) return // watchdog pehle hi agla chunk bhej chuka hai
+            inFlight = false
+            scheduleNext(if (pendingPause) BURST_PAUSE else delayFor(job?.size ?: 0))
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
@@ -888,6 +971,7 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
 
     @SuppressLint("MissingPermission")
     private fun finishDiscovery(g: BluetoothGatt) {
+        if (gatt == null) gatt = g
         if (discoveryFinished || gatt !== g) return
         discoveryFinished = true
         main.removeCallbacks(readyFallback)
@@ -904,6 +988,10 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
         if (raw.size < 8 || raw[0] != 0x51.toByte() || raw[1] != 0x78.toByte()) return
         val length = (raw[4].toInt() and 0xff) or ((raw[5].toInt() and 0xff) shl 8)
         if (raw.size < 6 + length || length == 0) return
+        if (statusFrames < 3) {
+            statusFrames++
+            report("Printer ka jawab: ${hex(raw)}")
+        }
         val data = raw.copyOfRange(6, 6 + length)
         val flags = data[0].toInt() and 0xff
         val battery = if (data.size > 1) data[1].toInt() and 0xff else -1
@@ -928,11 +1016,13 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
             return
         }
         printing = true
+        inFlight = false
+        ackWarned = false
         lastPct = -1
         onJobComplete = onComplete
         report("Bill taiyar ho raha hai…")
         Thread {
-            val bytes = try {
+            val built = try {
                 buildJob(bitmap)
             } catch (e: Exception) {
                 printing = false
@@ -941,9 +1031,10 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
                 return@Thread
             }
             main.post {
-                job = bytes
+                job = built.first
+                burstEnds = built.second
                 offset = 0
-                report("Printer ko bheja ja raha hai (${bytes.size / 1024 + 1} KB)…")
+                report("Printer ko bheja ja raha hai (${built.first.size / 1024 + 1} KB)…")
                 sendNext()
             }
         }.start()
@@ -952,6 +1043,7 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
     @SuppressLint("MissingPermission")
     private fun sendNext() {
         if (!printing) return
+        if (inFlight) return // ack/watchdog khud agli chunk bhejega
         val data = job ?: return
         val g = gatt
         val ch = writeChar
@@ -960,14 +1052,12 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
             return
         }
         if (offset >= data.size) {
-            printing = false
-            job = null
-            report("Print bhej diya — paper check karein")
-            notifyComplete(true)
+            finishJob()
             return
         }
         val end = minOf(data.size, offset + chunkSize)
         val slice = data.copyOfRange(offset, end)
+        val previous = offset
         offset = end
 
         val started = try {
@@ -985,16 +1075,58 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
             lastPct = pct
             if (pct < 100) report("Print ho raha hai… $pct%")
         }
+
+        val pause = burstEnds.any { it > previous && it <= offset }
+        pendingPause = pause
+        if (writeNeedsResponse) {
+            inFlight = true
+            main.removeCallbacks(ackWatchdog)
+            main.postDelayed(ackWatchdog, ACK_TIMEOUT)
+        } else {
+            scheduleNext(if (pause) BURST_PAUSE else delayFor(data.size))
+        }
+    }
+
+    private fun scheduleNext(delay: Long) {
+        main.removeCallbacks(nextChunk)
+        main.postDelayed(nextChunk, delay)
+    }
+
+    private fun onAckTimeout() {
+        if (!printing || !inFlight) return
+        if (ackWarned) {
+            abortJob("Printer write ka jawab nahi de raha — printer off/on kar ke dobara connect karein")
+            return
+        }
+        ackWarned = true
+        report("Printer write ka jawab nahi de raha — intezaar…")
+        main.postDelayed(ackWatchdog, 3_000)
+    }
+
+    private fun delayFor(size: Int): Long = if (size > 20_000) 25L else 10L
+
+    private fun finishJob() {
+        printing = false
+        inFlight = false
+        job = null
+        offset = 0
+        main.removeCallbacks(ackWatchdog)
+        report("Print bhej diya — printer 3 second mein parchi nikaal dega")
+        notifyComplete(true)
     }
 
     @Suppress("DEPRECATION")
     @SuppressLint("MissingPermission")
     private fun writeChunk(g: BluetoothGatt, ch: BluetoothGattCharacteristic, slice: ByteArray): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(ch, slice, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
-                BluetoothStatusCodes.SUCCESS
+        val type = if (writeNeedsResponse) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         } else {
-            ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeCharacteristic(ch, slice, type) == BluetoothStatusCodes.SUCCESS
+        } else {
+            ch.writeType = type
             ch.value = slice
             g.writeCharacteristic(ch)
         }
@@ -1002,8 +1134,12 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
 
     private fun abortJob(message: String) {
         printing = false
+        inFlight = false
         job = null
+        burstEnds = IntArray(0)
         offset = 0
+        main.removeCallbacks(ackWatchdog)
+        main.removeCallbacks(nextChunk)
         report(message)
         notifyComplete(false)
     }
@@ -1014,17 +1150,33 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
         main.post { callback(success) }
     }
 
-    /** Rasterises the bitmap and wraps it in the SC03H packet stream. */
-    private fun buildJob(source: Bitmap): ByteArray {
+    /**
+     * Rasterises the bitmap and wraps it in the SC03H packet stream.
+     * Byte stream ke saath un offsets ko bhi return karta hai jahan burst khatam hota hai
+     * (packet boundary par, taake printer ko adhoora packet na mile).
+     */
+    private fun buildJob(source: Bitmap): Pair<ByteArray, IntArray> {
         val bitmap = if (source.width == 384) source else Bitmap.createScaledBitmap(
             source, 384, (source.height * 384f / source.width).roundToInt().coerceAtLeast(1), true
         )
         val out = ByteArrayOutputStream()
-        out.write(packet(0xA3, byteArrayOf(0x00))) // wake
-        out.write(packet(0xA4, byteArrayOf(0x33))) // quality
-        out.write(packet(0xAF, byteArrayOf(0x70, 0x44))) // energy 17520
-        out.write(packet(0xBE, byteArrayOf(0x00))) // 1-bit image mode
-        out.write(packet(0xBD, byteArrayOf(0x23))) // print speed
+        val bursts = ArrayList<Int>()
+        var sinceBurst = 0
+
+        fun emit(bytes: ByteArray) {
+            out.write(bytes)
+            sinceBurst += bytes.size
+            if (sinceBurst >= BURST_BYTES) {
+                bursts.add(out.size())
+                sinceBurst = 0
+            }
+        }
+
+        emit(packet(0xA3, byteArrayOf(0x00))) // wake
+        emit(packet(0xA4, byteArrayOf(0x33))) // quality
+        emit(packet(0xAF, byteArrayOf(0x70, 0x44))) // energy 17520
+        emit(packet(0xBE, byteArrayOf(0x00))) // 1-bit image mode
+        emit(packet(0xBD, byteArrayOf(0x23))) // print speed
 
         val w = minOf(384, bitmap.width)
         val h = bitmap.height
@@ -1041,10 +1193,10 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
                     row[x ushr 3] = (row[x ushr 3].toInt() or (1 shl (7 - (x and 7)))).toByte()
                 }
             }
-            out.write(packet(0xA2, row))
+            emit(packet(0xA2, row))
         }
-        repeat(50) { out.write(packet(0xBD, byteArrayOf(0x23))) } // tear-bar feed
-        return out.toByteArray()
+        repeat(50) { emit(packet(0xBD, byteArrayOf(0x23))) } // tear-bar feed
+        return out.toByteArray() to bursts.toIntArray()
     }
 
     private fun packet(op: Int, payload: ByteArray): ByteArray {
@@ -1079,12 +1231,21 @@ class IPrintBlePrinter(private val context: Context, private val report: (String
         return NAME_HINTS.any { n.contains(it) }
     }
 
+    private fun shortUuid(uuid: UUID): String =
+        uuid.toString().substring(4, 8).lowercase(Locale.US)
+
+    private fun hex(bytes: ByteArray): String =
+        bytes.joinToString(" ") { String.format(Locale.US, "%02X", it.toInt() and 0xff) }
+
     private companion object {
         val SERVICE_ID: UUID = UUID.fromString("0000ae30-0000-1000-8000-00805f9b34fb")
         val WRITE_ID: UUID = UUID.fromString("0000ae01-0000-1000-8000-00805f9b34fb")
         val NOTIFY_ID: UUID = UUID.fromString("0000ae02-0000-1000-8000-00805f9b34fb")
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
         const val MAX_CHUNK = 180
+        const val BURST_BYTES = 4096
+        const val BURST_PAUSE = 600L
+        const val ACK_TIMEOUT = 500L
         val NAME_HINTS = listOf(
             "sc03", "iprint", "fc02", "gb01", "gb02", "walkprint", "funprint",
             "pocket", "thermal", "print"

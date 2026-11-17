@@ -104,4 +104,4 @@ Sirf tab data jata hai jab app **uninstall** karein.
 | GitHub Actions red cross | Run kholein → jo step fail hua us ka log copy kar ke bhejein |
 | Android Studio sync fail | Message copy karein; aksar SDK path (`local.properties`) ka masla hota hai — Studio khud bana deta hai, dobara sync karein |
 | APK install nahi ho rahi | "Install unknown apps" allow karein; purani app ho to pehle uninstall? Nahi — same app upar install hoti hai, bas version code barha hona chahiye |
-| Print nahi nikal raha | README ke Troubleshooting table dekhein |
+| Print nahi nikal raha | App mein **Debug log** button dabayein → **Share** → log WhatsApp par khud ko bhejein. Us log se pata chalta hai print kis step par ruka |

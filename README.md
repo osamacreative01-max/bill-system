@@ -15,6 +15,7 @@ Ye ek Android Studio **source project** hai — compiled APK nahi.
 - BLE: scan → connect → notify subscribe → MTU negotiate → paced 180-byte chunks
 - Android 12+ (Nearby devices permission) aur Android 6–11 (location permission) dono handle
 - Printer battery % aur "paper khatam" status (jab printer bhejta ho)
+- **Debug log** — connect/print ke har step ka log; screen par aakhri 5 lines, "Debug log" button se poora log + WhatsApp share
 - **Bill history** — har print hone wala bill save, main screen par "Aaj ki sale"
 - **Backup / Share** — poora CSV (WhatsApp / email / Drive pe bhejne ke liye)
 
@@ -56,9 +57,11 @@ ya Android Studio). Chhota khulasa:
 |---|---|
 | "SC03H nahi mila. Qareeb ke devices: …" | Status mein jo names aayein wo bhejein — ho sakta hai aapka printer ka naam list se different ho. Printer paas rakhein, off/on kar ke dobara scan karein. |
 | "Printer ka write channel nahi mila" | Firmware alag hai (sirf standard ESC/POS). Is case mein SC03H protocol kaam nahi karega. |
+| **Print / Test Print dabane par kuch nahi hota** | **Debug log** button dabayein → poora log dikhega (kis step par ruka). "Share" se WhatsApp par khud ko bhej dein. Ye log hi asli wajah batata hai. |
+| "Print nahi hua: printer ready nahi hai" | Printer connect nahi hai ya link toot gaya — **SC03H Printer Connect** dobara dabayein. |
 | Connect hua magar paper khali | Battery charge karein; paper ka shiny side printing head ki taraf hona chahiye; **Test Print** dobara. |
 | Print fail (status 133) | Bluetooth link toot gaya. Printer off/on kar ke app mein dobara connect karein. |
-| Aadha bill chhapa | Printer buffer — app 180-byte chunks 10/25 ms ke gap se bhejta hai; print ke doran printer ke paas na rahein aur app background mein na karein. |
+| Aadha bill chhapa | Printer buffer — app 180-byte chunks bhejta hai aur har ~4 KB par 600 ms ka drain pause deta hai; print ke doran printer ke paas na rahein aur app background mein na karein. |
 | "Paper khatam hai" | Naya roll lagayein. |
 
 ## Protocol note (zaroori)
